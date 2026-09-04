@@ -1,3 +1,4 @@
+import math
 import os
 import requests
 from io import BytesIO
@@ -52,7 +53,16 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
         return {
             "required": {
                 "url_or_path": ("STRING", {"multiline": True, "dynamicPrompts": False})
-            }
+            },
+            "optional": {
+                "duration": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1e5,
+                    "step": 0.001,
+                    "tooltip": "Trim the video to this many seconds, starting at 0s. 0 means no trimming.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "FLOAT", "AUDIO", "VHS_VIDEOINFO")
@@ -60,8 +70,11 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
     FUNCTION = "load"
     CATEGORY = "image/video"
 
-    def extract_frames(self, video_path):
-        """Extract frames from video and return as torch tensor along with fps and metadata"""
+    def extract_frames(self, video_path, duration=0.0):
+        """Extract frames from video and return as torch tensor along with fps and metadata.
+
+        If duration > 0, only frames whose timestamp is before `duration` seconds are
+        kept (same cutoff as the built-in Trim Video node, which always starts at 0s)."""
         video_cap = cv2.VideoCapture(video_path)
         if not video_cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
@@ -72,10 +85,18 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
         width = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # Match the built-in trim: keep frames with timestamp < duration.
+        max_frames = None
+        if duration and fps and fps > 0:
+            max_frames = int(math.ceil(duration * fps - 1e-9))
+
         frames = []
         frame_count = 0
 
         while True:
+            if max_frames is not None and frame_count >= max_frames:
+                break
+
             ret, frame = video_cap.read()
             if not ret:
                 break
@@ -104,8 +125,10 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
 
         return frames_tensor, float(fps), meta
 
-    def extract_audio(self, video_path):
-        """Extract audio from video and return as ComfyUI AUDIO dict, or None if no audio."""
+    def extract_audio(self, video_path, duration=0.0):
+        """Extract audio from video and return as ComfyUI AUDIO dict, or None if no audio.
+
+        If duration > 0, the audio is trimmed to the first `duration` seconds."""
         try:
             with av.open(video_path) as container:
                 if not container.streams.audio:
@@ -117,6 +140,8 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
 
                 audio_frames = []
                 for frame in container.decode(streams=stream.index):
+                    if duration and frame.time is not None and frame.time > duration:
+                        break
                     buf = torch.from_numpy(frame.to_ndarray())
                     if buf.shape[0] != n_channels:
                         buf = buf.view(-1, n_channels).t()
@@ -126,6 +151,11 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
                     return None
 
                 waveform = torch.cat(audio_frames, dim=1)
+                if duration:
+                    waveform = waveform[..., :int(duration * sample_rate)]
+                    if waveform.shape[-1] == 0:
+                        return None
+
                 # Convert to float32 PCM
                 if not waveform.dtype.is_floating_point:
                     if waveform.dtype == torch.int16:
@@ -137,11 +167,14 @@ class LoadVideoByUrlOrPath(ComfyNodeABC):
         except Exception:
             return None
 
-    def load(self, url_or_path):
+    def load(self, url_or_path, duration=0.0):
         print(f"Loading video from: {url_or_path}")
+        duration = max(0.0, float(duration or 0.0))
+        if duration:
+            print(f"Trimming video to the first {duration}s")
         video_path, name = load_video(url_or_path)
-        frames, fps, meta = self.extract_frames(video_path)
-        audio = self.extract_audio(video_path)
+        frames, fps, meta = self.extract_frames(video_path, duration)
+        audio = self.extract_audio(video_path, duration)
 
         # Build VHS_VIDEOINFO dict in the same format as comfyui-videohelpersuite.
         # This node loads every frame at native resolution, so loaded_* mirrors source_*
